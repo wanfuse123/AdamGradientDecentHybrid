@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+
+import os
+import hashlib
+import psutil
+import gc
+import signal
+import sys
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import torch
+from torch.utils.data import DataLoader
+from requests.exceptions import RequestException
+from multiprocessing import Process, Queue, cpu_count
+from hybrid_optimizer import HybridOptimizer
+from numba import jit, prange
+import resource
+import re
+import requests
+
+# Set the correct directory for caching
+cache_dir = '/home/top/sdb1/numberline_storage/NN_storage/huggingface_cache'
+os.environ['TRANSFORMERS_CACHE'] = cache_dir
+os.environ['HF_HOME'] = cache_dir
+
+# Ensure the cache directory is writable
+try:
+    os.makedirs(cache_dir, exist_ok=True)
+except PermissionError:
+    print(f"PermissionError: Unable to create cache directory at {cache_dir}.")
+    sys.exit(1)
+
+print(f"Cache directory set to: {os.environ['TRANSFORMERS_CACHE']}")
+
+# Set up CPU
+device = torch.device('cpu')
+print("Using CPU")
+
+# Memory management functions
+def monitor_memory(threshold=80):
+    process = psutil.Process(os.getpid())
+    cpu_mem = process.memory_info().rss / 1e9  # Convert to GB
+    total_mem = psutil.virtual_memory().total / 1e9  # Convert to GB
+    used_mem_percent = (cpu_mem / total_mem) * 100
+    print(f"Current memory usage - CPU: {cpu_mem:.2f} GB ({used_mem_percent:.2f}%)")
+    if used_mem_percent > threshold:
+        print("System memory usage exceeded threshold. Triggering garbage collection.")
+        gc.collect()
+
+def limit_memory_usage(fraction=0.8):
+    total_memory = psutil.virtual_memory().total
+    limit = int(total_memory * fraction)
+    resource.setrlimit(resource.RLIMIT_AS, (limit, limit))
+
+# Signal handler for interrupts
+def signal_handler(sig, frame):
+    print("Script interrupted. Clearing memory and swap...")
+    gc.collect()
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+
+# Download and process books from Project Gutenberg
+def download_books(book_ids):
+    books = []
+    for b in book_ids:
+        try:
+            url = f"http://www.gutenberg.org/ebooks/{b}.txt.utf-8"
+            response = requests.get(url)
+            response.raise_for_status()
+            books.append(response.text)
+        except RequestException as e:
+            print(f"RequestException: Failed to download book {b}: {e}")
+    return books
+
+# Processing text
+def preprocess_text(text):
+    text = text.lower()
+    text = re.sub(r'[^a-z0-9\s]', '', text)
+    return text.split()
+
+# Function to train the model
+def train_model(model_name, current_blocks, next_blocks, batch_size=16, max_length=512, queue=None):
+    model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=cache_dir)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
+    
+    # Add padding token if not present
+    if tokenizer.pad_token is None:
+        tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token})
+
+    model.resize_token_embeddings(len(tokenizer))
+    model.to(device)
+
+    # Ensure current_blocks is a list of strings
+    data = [' '.join(block) if isinstance(block, list) else block for block in current_blocks]
+
+    inputs = tokenizer(data, return_tensors='pt', padding=True, truncation=True, max_length=max_length)
+    inputs = inputs.to(device)
+
+    optimizer = HybridOptimizer(model.parameters())
+
+    model.train()
+    for epoch in range(1):  # Set to 1 for testing
+        for i in range(0, len(inputs.input_ids), batch_size):
+            batch_input_ids = inputs.input_ids[i:i+batch_size]
+            batch_attention_mask = inputs.attention_mask[i:i+batch_size]
+            optimizer.zero_grad()
+            outputs = model(input_ids=batch_input_ids, attention_mask=batch_attention_mask, labels=batch_input_ids)
+            loss = outputs.loss
+            loss.backward()
+            optimizer.step()
+            print(f"Epoch {epoch+1}, Batch {i//batch_size+1}/{len(inputs.input_ids)//batch_size}, Loss: {loss.item()}")
+
+    if queue:
+        queue.put(model)
+    else:
+        return model
+
+# Multiprocessing training function
+def multiprocessing_training(data, batch_size=16, max_length=512):
+    linked_lists = [LinkedList(block) for block in data]
+    current_blocks = [linked_list.data for linked_list in linked_lists]
+    next_blocks = [linked_list.data for linked_list in linked_lists[1:]]
+
+    # Multiprocessing setup
+    num_workers = min(cpu_count(), len(current_blocks))
+    queue = Queue()
+    processes = []
+    model_names = [
+        'gpt2',
+        'EleutherAI/gpt-neo-125M',
+        'EleutherAI/gpt-j-6B',
+    ]
+
+    for model_name in model_names:
+        p = Process(target=train_model, args=(model_name, current_blocks, next_blocks, batch_size, max_length, queue))
+        p.start()
+        processes.append(p)
+
+    models = []
+    for p in processes:
+        p.join()
+        models.append(queue.get())
+
+    print("Retrieving sequence of blocks...")
+    for model, model_name in zip(models, model_names):
+        
+        tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
+        
+        # Add padding token if not present
+        if tokenizer.pad_token is None:
+            tokenizer.add_special_tokens({'pad_token': tokenizer.eos_token})
+
+        print(f"Using model: {model_name}")
+        reconstructed_blocks = []
+        current_block = linked_lists[0].data
+        for _ in range(len(linked_lists) - 1):
+            next_block = predict_next_block(current_block, model, tokenizer, max_length)
+            reconstructed_blocks.append(next_block)
+            current_block = next_block
+
+        print(f"Reconstructed {len(reconstructed_blocks)} blocks")
+        monitor_memory()
+
+        print("Combining reconstructed blocks...")
+
+        reconstructed_data = combine_blocks(reconstructed_blocks)
+
+        print(f"Results for {model_name}:")
+        print("Original data size:", len(combine_blocks(blocks)))
+        print("Reconstructed data size:", len(reconstructed_data))
+        print("Data match:", reconstructed_data == combine_blocks(blocks))
+        print("\n")
+
+        # Clear memory
+        del model
+        gc.collect()  # Collect garbage to free system memory
+
+# Function to predict the next block in the sequence
+def predict_next_block(current_block, model, tokenizer, max_length):
+    inputs = tokenizer(current_block, return_tensors='pt', max_length=max_length, truncation=True, padding=True)
+    inputs = inputs.to(device)
+    model.eval()
+    with torch.no_grad():
+        outputs = model(**inputs)
+    predicted_ids = torch.argmax(outputs.logits, dim=-1)
+    predicted_text = tokenizer.decode(predicted_ids[0], skip_special_tokens=True)
+    return predicted_text
+
+# Combine blocks into a single text
+def combine_blocks(blocks):
+    return ' '.join(blocks)
+
+# LinkedList class for block manipulation
+class LinkedList:
+    def __init__(self, data=None):
+        self.data = data
+        self.next = None
+
+    def append(self, data):
+        new_node = LinkedList(data)
+        current = self
+        while current.next:
+            current = current.next
+        current.next = new_node
+
+# Main execution
+if __name__ == "__main__":
+    book_ids = [1342, 84, 11, 2701, 1661]
+    print("Downloading books...")
+    books = download_books(book_ids)
+    
+    print("Preprocessing text...")
+    processed_books = [preprocess_text(book) for book in books]
+    
+    print("Training models using multiprocessing...")
+    multiprocessing_training(processed_books)
+
+    print("Process completed.")
