@@ -18,7 +18,7 @@ import re
 import requests
 
 # Set the correct directory for caching
-cache_dir = '/home/top/sdb1/numberline_storage/NN_storage/huggingface_cache'
+cache_dir = '/home/tt/huggingface_cache'
 os.environ['TRANSFORMERS_CACHE'] = cache_dir
 os.environ['HF_HOME'] = cache_dir
 
