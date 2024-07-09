@@ -15,7 +15,7 @@ from gutenberg.cleanup import strip_headers
 from requests.exceptions import RequestException
 
 # Set the correct directory for caching
-cache_dir = '/home/top/sdg1/numberline_storage/hugginface/hub'
+cache_dir = '/home/tt/hugginface/hub'
 os.environ['TRANSFORMERS_CACHE'] = cache_dir
 os.environ['HF_HOME'] = cache_dir
 os.makedirs(cache_dir, exist_ok=True)
