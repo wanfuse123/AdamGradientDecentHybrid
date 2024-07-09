@@ -15,7 +15,7 @@ from requests.exceptions import RequestException
 import psutil
 
 # Set the correct directory for caching
-cache_dir = '/home/top/sdc1/sdg1/numberline_storage/hugginface/hub'
+cache_dir = '/home/tt/hugginface/hub'
 os.environ['TRANSFORMERS_CACHE'] = cache_dir
 os.environ['HF_HOME'] = cache_dir
 os.makedirs(cache_dir, exist_ok=True)
